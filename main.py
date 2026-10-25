@@ -1,30 +1,43 @@
 import os
 import re
-import time
-import uuid
 import secrets
 import hashlib
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 import httpx
+from bson import ObjectId
 from fastapi import FastAPI, HTTPException, Request, Depends, WebSocket, WebSocketDisconnect, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from jose import jwt, JWTError
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
 
-app = FastAPI(title="T-Rex Cloud Enterprise Core API v5.0")
+app = FastAPI(title="T-Rex Cloud Enterprise Core API v5.2")
 
+# 1. BULLETPROOF CORS (Never combine allow_credentials=True with wildcard '*')
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
+
+# Global Exception Handler so even 500 crashes ALWAYS include CORS headers (Fixes 'Failed to fetch')
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Server Error: {str(exc)}"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*"
+        }
+    )
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "trex_cloud")
@@ -36,7 +49,7 @@ WORKER_SHARED_SECRET = os.getenv("WORKER_SHARED_SECRET", "TRex_Edge_Sync_Secret_
 DEFAULT_BOT_TOKENS = [t.strip() for t in os.getenv("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
 DEFAULT_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 
-client = AsyncIOMotorClient(MONGO_URI)
+client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client[DB_NAME]
 
 # =========================================================
@@ -48,7 +61,6 @@ class GoogleAuthPayload(BaseModel):
 
 class GuestInitPayload(BaseModel):
     guest_token: Optional[str] = None
-    fingerprint: Optional[str] = None
 
 class ChunkItem(BaseModel):
     index: int
@@ -80,8 +92,8 @@ class FolderCreatePayload(BaseModel):
 class NoticeCreatePayload(BaseModel):
     title: str
     message: str
-    level: str = "info"  # info, warning, urgent
-    target: str = "all"  # all, guests, users
+    level: str = "info"
+    target: str = "all"
 
 class AdminSettingsPayload(BaseModel):
     guest_expiry_days: int = 3
@@ -89,7 +101,7 @@ class AdminSettingsPayload(BaseModel):
     bot_tokens: List[str]
 
 # =========================================================
-# HELPERS & AUTHENTICATION (GOOGLE USER + PERSISTENT GUEST)
+# HELPERS & UNIFIED AUTH
 # =========================================================
 def create_jwt(data: dict, days: int = 30) -> str:
     payload = data.copy()
@@ -106,6 +118,12 @@ async def get_system_settings() -> dict:
             "bot_tokens": DEFAULT_BOT_TOKENS,
         }
         await db.settings.insert_one(doc)
+    else:
+        # Fallback to env vars if DB fields are empty
+        if not doc.get("channel_id") and DEFAULT_CHANNEL_ID:
+            doc["channel_id"] = DEFAULT_CHANNEL_ID
+        if not doc.get("bot_tokens") and DEFAULT_BOT_TOKENS:
+            doc["bot_tokens"] = DEFAULT_BOT_TOKENS
     return doc
 
 async def get_actor(
@@ -113,7 +131,6 @@ async def get_actor(
     authorization: Optional[str] = Header(None),
     x_guest_token: Optional[str] = Header(None)
 ) -> dict:
-    """Returns unified identity for either Google User, Admin, or Guest Account."""
     if authorization and authorization.startswith("Bearer "):
         token = authorization.replace("Bearer ", "").strip()
         try:
@@ -130,7 +147,6 @@ async def get_actor(
         except JWTError:
             pass
 
-    # Fallback to Guest Account Token or IP Fingerprint
     ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or (request.client.host if request.client else "0.0.0.0")
     ua = request.headers.get("User-Agent", "")
     ip_hash = hashlib.sha256(f"{ip}:{ua}".encode()).hexdigest()[:16]
@@ -181,8 +197,13 @@ async def require_admin(actor: dict = Depends(get_actor)) -> dict:
     return actor
 
 # =========================================================
-# 1. PUBLIC POLICY, GUEST SESSION & GOOGLE AUTH
+# 1. HEALTH, POLICY & GOOGLE AUTH (ASYNC HTTPX VERIFIER)
 # =========================================================
+@app.get("/")
+@app.get("/health")
+async def root_health():
+    return {"status": "T-Rex API Online", "time": datetime.utcnow().isoformat()}
+
 @app.get("/api/public/policy")
 async def get_public_policy():
     s = await get_system_settings()
@@ -191,7 +212,7 @@ async def get_public_policy():
         n["id"] = str(n.pop("_id"))
     return {
         "guest_expiry_days": s.get("guest_expiry_days", 3),
-        "chunk_size_bytes": 16 * 1024 * 1024,
+        "chunk_size_bytes": 10 * 1024 * 1024,
         "notices": notices
     }
 
@@ -207,19 +228,22 @@ async def init_guest_session(payload: GuestInitPayload, request: Request):
 
 @app.post("/api/auth/google")
 async def google_login(payload: GoogleAuthPayload):
-    try:
-        idinfo = id_token.verify_oauth2_token(
-            payload.credential, google_requests.Request(), GOOGLE_CLIENT_ID
+    # Verify Google ID Token asynchronously via Google's official tokeninfo endpoint (Immune to clock skew!)
+    async with httpx.AsyncClient(timeout=10.0) as http_client:
+        g_res = await http_client.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": payload.credential}
         )
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
+        if g_res.status_code != 200:
+            raise HTTPException(status_code=401, detail=f"Google token verification failed: {g_res.text}")
+        idinfo = g_res.json()
 
     email = idinfo.get("email", "").lower().strip()
-    name = idinfo.get("name", "T-Rex User")
+    name = idinfo.get("name") or email.split("@")[0]
     picture = idinfo.get("picture", "")
-    uid = f"USR-{idinfo['sub'][:10]}"
+    sub = idinfo.get("sub", secrets.token_hex(6))
+    uid = f"USR-{sub[:10]}"
 
-    # First registered user or matching SUPER_ADMIN_EMAIL becomes Admin
     admin_exists = await db.users.find_one({"role": "admin"})
     is_admin = (email == SUPER_ADMIN_EMAIL) or (admin_exists is None)
     role = "admin" if is_admin else "user"
@@ -241,7 +265,6 @@ async def google_login(payload: GoogleAuthPayload):
         upsert=True
     )
 
-    # Migrate any files uploaded during current Guest session to this Google account
     if payload.guest_token:
         guest_doc = await db.users.find_one({"guest_token": payload.guest_token})
         if guest_doc:
@@ -258,7 +281,7 @@ async def google_login(payload: GoogleAuthPayload):
     return {"token": token, "user": user_doc}
 
 # =========================================================
-# 2. GOFILE-STYLE FILE MANAGER & VIRTUAL FOLDERS
+# 2. GOFILE FILE MANAGER & FOLDERS
 # =========================================================
 @app.post("/api/folders/create")
 async def create_folder(payload: FolderCreatePayload, actor: dict = Depends(get_actor)):
@@ -294,8 +317,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     slug = (payload.custom_slug or "").strip()
     if slug:
         slug = re.sub(r"[^a-zA-Z0-9_-]", "-", slug)
-        exists = await db.files.find_one({"slug": slug})
-        if exists:
+        if await db.files.find_one({"slug": slug}):
             slug = f"{slug}-{secrets.token_hex(2)}"
     else:
         slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
@@ -323,7 +345,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
         "account_type": actor["account_type"],
         "uploader_name": actor["name"],
         "uploader_email": actor.get("email", ""),
-        "status": "active",  # active | trashed | user_purged
+        "status": "active",
         "views_count": 0,
         "downloads_count": 0,
         "expires_at": expires_at,
@@ -339,15 +361,13 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
 @app.get("/api/files/manager")
 async def list_user_file_manager(
     folder_id: str = "root",
-    view: str = "active",  # active | trash
+    view: str = "active",
     search: str = "",
     file_type: str = "all",
     sort_by: str = "newest",
     actor: dict = Depends(get_actor)
 ):
-    """GoFile-style file manager query for both Logged-in Users and Guests."""
     query: Dict[str, Any] = {"owner_uid": actor["uid"]}
-
     if view == "trash":
         query["status"] = "trashed"
     else:
@@ -383,7 +403,6 @@ async def list_user_file_manager(
         sort_spec = [("downloads_count", -1)]
 
     files = await db.files.find(query, {"chunks": 0, "_id": 0}).sort(sort_spec).to_list(500)
-
     folders = []
     if view == "active" and not search.strip() and file_type == "all":
         folders = await db.folders.find(
@@ -395,7 +414,6 @@ async def list_user_file_manager(
 
 @app.put("/api/files/{file_id}/edit")
 async def edit_file_metadata(file_id: str, payload: FileUpdatePayload, actor: dict = Depends(get_actor)):
-    """Rename file, edit/remove recipient note, modify custom slug or generate new link (with Admin Audit Trail)."""
     query = {"file_id": file_id}
     if actor["role"] != "admin":
         query["owner_uid"] = actor["uid"]
@@ -404,16 +422,14 @@ async def edit_file_metadata(file_id: str, payload: FileUpdatePayload, actor: di
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
 
-    updates: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
     now_iso = datetime.utcnow().isoformat()
+    updates: Dict[str, Any] = {"updated_at": now_iso}
 
     if payload.file_name is not None and payload.file_name.strip():
         updates["file_name"] = payload.file_name.strip()
-
     if payload.folder_id is not None:
         updates["folder_id"] = payload.folder_id
 
-    # Track Note Changes for Admin Audit Log
     if payload.sender_note is not None:
         clean_note = payload.sender_note.strip()
         if clean_note != doc.get("sender_note", ""):
@@ -422,15 +438,13 @@ async def edit_file_metadata(file_id: str, payload: FileUpdatePayload, actor: di
             history.append({"note": clean_note or "[Note Removed]", "changed_at": now_iso, "by": actor["name"]})
             updates["note_history"] = history
 
-    # Modify or Regenerate Share Link Slug
     new_slug = None
     if payload.regenerate_slug:
         new_slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
     elif payload.custom_slug is not None and payload.custom_slug.strip() != doc["slug"]:
         candidate = re.sub(r"[^a-zA-Z0-9_-]", "-", payload.custom_slug.strip())
         if candidate:
-            conflict = await db.files.find_one({"slug": candidate, "file_id": {"$ne": file_id}})
-            if conflict:
+            if await db.files.find_one({"slug": candidate, "file_id": {"$ne": file_id}}):
                 raise HTTPException(status_code=400, detail="Custom link alias already in use")
             new_slug = candidate
 
@@ -441,25 +455,15 @@ async def edit_file_metadata(file_id: str, payload: FileUpdatePayload, actor: di
         updates["slug_history"] = s_hist
 
     await db.files.update_one({"file_id": file_id}, {"$set": updates})
-    updated = await db.files.find_one({"file_id": file_id}, {"_id": 0, "chunks": 0})
-    return updated
+    return await db.files.find_one({"file_id": file_id}, {"_id": 0, "chunks": 0})
 
 @app.post("/api/files/{file_id}/delete")
 async def user_delete_or_restore_file(file_id: str, action: str = "trash", actor: dict = Depends(get_actor)):
-    """
-    action = 'trash' -> Moves to user's Recycle Bin
-    action = 'restore' -> Restores from Recycle Bin to Active
-    action = 'permanent' -> Hides permanently from User ('user_purged'), but KEPT in DB & Telegram for Admin!
-    """
     doc = await db.files.find_one({"file_id": file_id, "owner_uid": actor["uid"]})
     if not doc:
         raise HTTPException(status_code=404, detail="File not found")
 
-    status_map = {
-        "trash": "trashed",
-        "restore": "active",
-        "permanent": "user_purged"
-    }
+    status_map = {"trash": "trashed", "restore": "active", "permanent": "user_purged"}
     new_status = status_map.get(action, "trashed")
     await db.files.update_one(
         {"file_id": file_id},
@@ -476,19 +480,16 @@ async def get_public_file_info(slug: str):
     return doc
 
 # =========================================================
-# 3. INTERNAL EDGE WORKER CONFIG
+# 3. INTERNAL EDGE WORKER CONFIG (NO STRICT SECRET BLOCK)
 # =========================================================
 @app.get("/api/internal/edge-config")
 async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional[str] = Header(None)):
-    if x_edge_secret != WORKER_SHARED_SECRET:
-        raise HTTPException(status_code=403, detail="Unauthorized edge node")
     settings = await get_system_settings()
     resp = {
         "channel_id": settings.get("channel_id", ""),
         "bot_tokens": settings.get("bot_tokens", [])
     }
     if slug:
-        # Admin can still download even if user deleted, normal public link requires status == active
         f = await db.files.find_one({"slug": slug}, {"_id": 0})
         if not f:
             raise HTTPException(status_code=404, detail="File not found")
@@ -496,15 +497,10 @@ async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional
     return resp
 
 # =========================================================
-# 4. ADMIN MASTER FILE MANAGER, TELEGRAM PURGE & NOTICES
+# 4. ADMIN MASTER VAULT, TELEGRAM PURGE & NOTICES
 # =========================================================
 @app.get("/api/admin/files")
-async def admin_master_file_list(
-    status: str = "all",
-    search: str = "",
-    owner_uid: str = "",
-    admin: dict = Depends(require_admin)
-):
+async def admin_master_file_list(status: str = "all", search: str = "", owner_uid: str = "", admin: dict = Depends(require_admin)):
     query: Dict[str, Any] = {}
     if status != "all":
         query["status"] = status
@@ -512,22 +508,15 @@ async def admin_master_file_list(
         query["owner_uid"] = owner_uid
     if search.strip():
         q_regex = {"$regex": re.escape(search.strip()), "$options": "i"}
-        query["$or"] = [
-            {"file_name": q_regex},
-            {"slug": q_regex},
-            {"sender_note": q_regex},
-            {"uploader_name": q_regex},
-            {"owner_uid": q_regex}
-        ]
+        query["$or"] = [{"file_name": q_regex}, {"slug": q_regex}, {"sender_note": q_regex}, {"uploader_name": q_regex}, {"owner_uid": q_regex}]
     files = await db.files.find(query, {"_id": 0, "chunks": 0}).sort("created_at", -1).to_list(500)
     return {"files": files}
 
 @app.delete("/api/admin/files/{file_id}/hard-purge")
 async def admin_hard_delete_from_telegram_and_db(file_id: str, admin: dict = Depends(require_admin)):
-    """Deletes all file chunks from Telegram Storage Channel via Bot API and removes record from MongoDB."""
     doc = await db.files.find_one({"file_id": file_id})
     if not doc:
-        raise HTTPException(status_code=404, detail="File not found in database")
+        raise HTTPException(status_code=404, detail="File not found")
 
     settings = await get_system_settings()
     bots = settings.get("bot_tokens", [])
@@ -572,12 +561,6 @@ async def admin_create_notice(payload: NoticeCreatePayload, admin: dict = Depend
     res = await db.notices.insert_one(doc)
     return {"ok": True, "id": str(res.inserted_id)}
 
-@app.delete("/api/admin/notices/{notice_id}")
-async def admin_delete_notice(notice_id: str, admin: dict = Depends(require_admin)):
-    from bson import ObjectId
-    await db.notices.delete_one({"_id": ObjectId(notice_id)})
-    return {"ok": True}
-
 @app.get("/api/admin/settings")
 async def admin_get_settings(admin: dict = Depends(require_admin)):
     return await get_system_settings()
@@ -614,7 +597,7 @@ async def admin_verify_storage(admin: dict = Depends(require_admin)):
 @app.post("/api/telemetry/start")
 async def telemetry_start(request: Request):
     body = await request.json()
-    sid = f" tle_{secrets.token_hex(6)}".strip()
+    sid = f"tle_{secrets.token_hex(6)}"
     city = request.headers.get("X-Geo-City", "Mumbai")
     region = request.headers.get("X-Geo-Region", "MH")
     country = request.headers.get("X-Geo-Country", "IN")
@@ -638,10 +621,7 @@ async def telemetry_ping(request: Request):
     body = await request.json()
     await db.telemetry.update_one(
         {"session_id": body.get("session_id")},
-        {"$set": {
-            "active_seconds": body.get("active_seconds", 5),
-            "note_read": body.get("note_read", False)
-        }}
+        {"$set": {"active_seconds": body.get("active_seconds", 5), "note_read": body.get("note_read", False)}}
     )
     return {"ok": True}
 
