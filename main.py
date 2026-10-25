@@ -13,7 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from jose import jwt, JWTError
 
-app = FastAPI(title="T-Rex Cloud Enterprise Core API v7.0 (Strict Watcher Edition)")
+app = FastAPI(title="T-Rex Cloud Enterprise Core API v8.0 (Multi-Channel Cluster)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,7 +44,7 @@ SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "vikramadityakumarshukla@gmai
 WORKER_SHARED_SECRET = os.getenv("WORKER_SHARED_SECRET", "TRex_Edge_Sync_Secret_99")
 
 DEFAULT_BOT_TOKENS = [t.strip() for t in os.getenv("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
-DEFAULT_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "-1003957020033").strip()
+DEFAULT_CHANNELS = [c.strip() for c in os.getenv("TELEGRAM_CHANNEL_ID", "-1003957020033").split(",") if c.strip()]
 
 client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client[DB_NAME]
@@ -60,15 +60,16 @@ class GuestInitPayload(BaseModel):
     guest_token: Optional[str] = None
 
 class StrictChunkItem(BaseModel):
-    part_id: str                 # e.g. "PART-0000"
-    index: int                   # 0, 1, 2...
-    start_byte: int              # Exact byte start offset
-    end_byte: int                # Exact byte end offset
-    size: int                    # Exact byte length
-    checksum: Optional[str] = "" # Integrity signature
-    file_id: str                 # Telegram file_id
+    part_id: str
+    index: int
+    start_byte: int
+    end_byte: int
+    size: int
+    checksum: Optional[str] = ""
+    file_id: str
     message_id: Optional[int] = None
     bot_index: int = 0
+    channel_id: Optional[str] = None
 
 class WatcherUploadInitPayload(BaseModel):
     file_name: str
@@ -77,6 +78,7 @@ class WatcherUploadInitPayload(BaseModel):
 
 class FileRegisterPayload(BaseModel):
     watch_id: Optional[str] = None
+    target_channel_id: Optional[str] = None
     file_name: str
     file_size: int
     mime_type: str = "application/octet-stream"
@@ -113,13 +115,14 @@ class NoticeCreatePayload(BaseModel):
 
 class AdminSettingsPayload(BaseModel):
     guest_expiry_days: int = 3
-    channel_id: str
+    channel_ids: Optional[List[str]] = None
+    channel_id: Optional[str] = None
     bot_tokens: List[str]
     chunk_size_mb: int = 8
     max_concurrency: int = 3
 
 # =========================================================
-# SYSTEM SETTINGS & CONCURRENCY CAP ENFORCER
+# PERSISTENT MULTI-CHANNEL & MULTI-BOT SETTINGS ENGINE
 # =========================================================
 def create_jwt(data: dict, days: int = 30) -> str:
     payload = data.copy()
@@ -132,28 +135,78 @@ async def get_system_settings() -> dict:
         doc = {
             "_id": "global",
             "guest_expiry_days": 3,
-            "channel_id": DEFAULT_CHANNEL_ID,
+            "channel_ids": DEFAULT_CHANNELS,
+            "channel_id": DEFAULT_CHANNELS[0] if DEFAULT_CHANNELS else "",
             "bot_tokens": DEFAULT_BOT_TOKENS,
             "chunk_size_mb": 8,
-            "max_concurrency": max(1, len(DEFAULT_BOT_TOKENS)) if DEFAULT_BOT_TOKENS else 1
+            "max_concurrency": max(1, len(DEFAULT_BOT_TOKENS)) if DEFAULT_BOT_TOKENS else 1,
+            "channel_cursor": 0
         }
         await db.settings.insert_one(doc)
-    else:
-        if not doc.get("channel_id") and DEFAULT_CHANNEL_ID:
-            doc["channel_id"] = DEFAULT_CHANNEL_ID
-        if not doc.get("bot_tokens") and DEFAULT_BOT_TOKENS:
-            doc["bot_tokens"] = DEFAULT_BOT_TOKENS
 
-    bots_count = max(1, len(doc.get("bot_tokens") or []))
+    # Normalize channel_ids list & legacy channel_id field
+    raw_channels = doc.get("channel_ids") or []
+    if isinstance(raw_channels, str):
+        raw_channels = [c.strip() for c in raw_channels.split("\n") if c.strip()]
+    if not raw_channels and doc.get("channel_id"):
+        raw_channels = [c.strip() for c in str(doc["channel_id"]).split("\n") if c.strip()]
+    if not raw_channels and DEFAULT_CHANNELS:
+        raw_channels = DEFAULT_CHANNELS
+
+    clean_channels = []
+    for ch in raw_channels:
+        for sub in str(ch).replace(",", "\n").split("\n"):
+            s = sub.strip()
+            if s and s not in clean_channels:
+                clean_channels.append(s)
+
+    raw_bots = doc.get("bot_tokens") or []
+    if isinstance(raw_bots, str):
+        raw_bots = [b.strip() for b in raw_bots.split("\n") if b.strip()]
+    clean_bots = []
+    for b in raw_bots:
+        for sub in str(b).replace(",", "\n").split("\n"):
+            s = sub.strip()
+            if s and s not in clean_bots:
+                clean_bots.append(s)
+    if not clean_bots and DEFAULT_BOT_TOKENS:
+        clean_bots = DEFAULT_BOT_TOKENS
+
+    bots_count = max(1, len(clean_bots))
     chunk_mb = max(2, min(19, int(doc.get("chunk_size_mb") or 8)))
-    # STRICT RULE: Concurrent upload streams CANNOT exceed number of added bots!
     raw_conc = int(doc.get("max_concurrency") or bots_count)
     effective_conc = max(1, min(raw_conc, bots_count))
 
-    doc["chunk_size_mb"] = chunk_mb
-    doc["max_concurrency"] = effective_conc
-    doc["bots_count"] = bots_count
-    return doc
+    return {
+        "guest_expiry_days": int(doc.get("guest_expiry_days") or 3),
+        "channel_ids": clean_channels,
+        "channel_id": clean_channels[0] if clean_channels else "",
+        "channels_count": len(clean_channels),
+        "bot_tokens": clean_bots,
+        "bots_count": len(clean_bots),
+        "chunk_size_mb": chunk_mb,
+        "max_concurrency": effective_conc,
+        "updated_at": doc.get("updated_at", "")
+    }
+
+async def pick_dedicated_channel_for_file() -> str:
+    """Selects ONE dedicated channel in round-robin order so ALL parts of a file stay in the exact same channel."""
+    s = await get_system_settings()
+    channels = s.get("channel_ids") or []
+    if not channels:
+        return DEFAULT_CHANNELS[0] if DEFAULT_CHANNELS else ""
+    if len(channels) == 1:
+        return channels[0]
+
+    # Atomic round-robin counter in MongoDB
+    res = await db.settings.find_one_and_update(
+        {"_id": "global"},
+        {"$inc": {"channel_cursor": 1}},
+        upsert=True,
+        return_document=True
+    )
+    cursor = int((res or {}).get("channel_cursor", 0))
+    return channels[cursor % len(channels)]
 
 async def get_actor(
     request: Request,
@@ -226,12 +279,12 @@ async def require_admin(actor: dict = Depends(get_actor)) -> dict:
     return actor
 
 # =========================================================
-# 1. PUBLIC POLICY & DYNAMIC UPLOAD CONFIG
+# 1. PUBLIC POLICY & AUTH
 # =========================================================
 @app.get("/")
 @app.get("/health")
 async def root_health():
-    return {"status": "T-Rex API v7.0 Watcher Active", "time": datetime.utcnow().isoformat()}
+    return {"status": "T-Rex API v8.0 Multi-Channel Active", "time": datetime.utcnow().isoformat()}
 
 @app.get("/api/public/policy")
 async def get_public_policy():
@@ -246,6 +299,7 @@ async def get_public_policy():
         "chunk_size_bytes": chunk_mb * 1024 * 1024,
         "max_concurrency": s.get("max_concurrency", 1),
         "bots_count": s.get("bots_count", 1),
+        "channels_count": s.get("channels_count", 1),
         "notices": notices
     }
 
@@ -317,12 +371,19 @@ async def google_login(payload: GoogleAuthPayload):
     return {"token": token, "user": user_doc}
 
 # =========================================================
-# 2. STRICT TRANSFER WATCHER & PART-ID VERIFICATION ENGINE
+# 2. MULTI-CHANNEL WATCHER & STRICT SINGLE-CHANNEL AFFINITY
 # =========================================================
 @app.post("/api/watcher/init-upload")
 async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = Depends(get_actor)):
-    """Creates a strict part-by-part blueprint before upload starts and enforces bot concurrency."""
+    """
+    Assigns ONE dedicated Storage Channel (`target_channel_id`) for this entire file
+    so all chunks of this file stay together in the same channel!
+    """
     s = await get_system_settings()
+    target_channel_id = await pick_dedicated_channel_for_file()
+    if not target_channel_id:
+        raise HTTPException(status_code=500, detail="No Storage Channel configured in Admin Panel")
+
     chunk_bytes = int(s["chunk_size_mb"]) * 1024 * 1024
     total_parts = max(1, (payload.file_size + chunk_bytes - 1) // chunk_bytes)
     watch_id = f"WUP-{secrets.token_hex(5).upper()}"
@@ -337,7 +398,8 @@ async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = D
             "index": i,
             "start_byte": start_b,
             "end_byte": max(0, end_b),
-            "size": sz
+            "size": sz,
+            "target_channel_id": target_channel_id
         })
 
     watch_doc = {
@@ -346,6 +408,7 @@ async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = D
         "owner_uid": actor["uid"],
         "file_name": payload.file_name,
         "file_size": payload.file_size,
+        "target_channel_id": target_channel_id,
         "chunk_size_bytes": chunk_bytes,
         "allowed_concurrency": s["max_concurrency"],
         "bots_count": s["bots_count"],
@@ -357,6 +420,7 @@ async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = D
 
     return {
         "watch_id": watch_id,
+        "target_channel_id": target_channel_id,
         "chunk_size_bytes": chunk_bytes,
         "allowed_concurrency": s["max_concurrency"],
         "bots_count": s["bots_count"],
@@ -366,13 +430,17 @@ async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = D
 
 @app.post("/api/files/register")
 async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_actor)):
-    """Strictly validates that every single part (0..N-1) and exact byte offsets match before registering."""
     settings = await get_system_settings()
-
-    # 1. STRICT WATCHER INTEGRITY VERIFICATION
     sorted_chunks = sorted([c.dict() for c in payload.chunks], key=lambda x: x["index"])
     if not sorted_chunks:
         raise HTTPException(status_code=400, detail="Watcher Error: No chunks received")
+
+    # Lock the single storage channel used for this file
+    locked_channel = (
+        payload.target_channel_id
+        or sorted_chunks[0].get("channel_id")
+        or settings.get("channel_id")
+    )
 
     total_chunk_bytes = 0
     expected_offset = 0
@@ -384,6 +452,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
         ch["part_id"] = f"PART-{idx:04d}"
         ch["start_byte"] = expected_offset
         ch["end_byte"] = expected_offset + int(ch["size"]) - 1
+        ch["channel_id"] = ch.get("channel_id") or locked_channel
         expected_offset += int(ch["size"])
         total_chunk_bytes += int(ch["size"])
 
@@ -414,6 +483,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     file_doc = {
         "file_id": file_id,
         "watch_id": payload.watch_id or f"WUP-{secrets.token_hex(4).upper()}",
+        "storage_channel_id": locked_channel,
         "slug": slug,
         "slug_history": [{"slug": slug, "changed_at": now_iso}],
         "file_name": payload.file_name,
@@ -443,12 +513,19 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     if payload.watch_id:
         await db.transfer_watches.update_one(
             {"watch_id": payload.watch_id},
-            {"$set": {"status": "verified_complete", "slug": slug, "file_id": file_id, "completed_at": now_iso}}
+            {"$set": {
+                "status": "verified_complete",
+                "slug": slug,
+                "file_id": file_id,
+                "storage_channel_id": locked_channel,
+                "completed_at": now_iso
+            }}
         )
 
     return {
         "slug": slug,
         "file_id": file_id,
+        "storage_channel_id": locked_channel,
         "expires_at": expires_at,
         "verified_parts": len(sorted_chunks),
         "verified_bytes": total_chunk_bytes
@@ -456,7 +533,6 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
 
 @app.post("/api/watcher/verify-download")
 async def watcher_verify_download(payload: WatcherDownloadVerifyPayload):
-    """Logs verified download completion when client confirms all Part IDs and bytes match 100%."""
     if payload.status == "completed" and payload.received_bytes >= payload.total_bytes:
         await db.files.update_one({"slug": payload.slug}, {"$inc": {"downloads_count": 1}})
     await db.transfer_watches.insert_one({
@@ -626,7 +702,6 @@ async def get_public_file_info(slug: str):
     s = await get_system_settings()
     chunks_raw = sorted(doc.pop("chunks", []), key=lambda c: c["index"])
 
-    # Build strict part manifest with byte offsets for verified parallel downloading
     cumulative = 0
     chunks_meta = []
     for idx, c in enumerate(chunks_raw):
@@ -637,19 +712,20 @@ async def get_public_file_info(slug: str):
             "start_byte": c.get("start_byte", cumulative),
             "end_byte": c.get("end_byte", cumulative + sz - 1),
             "size": sz,
-            "checksum": c.get("checksum", "")
+            "channel_id": c.get("channel_id") or doc.get("storage_channel_id") or s.get("channel_id")
         })
         cumulative += sz
 
     doc["chunks_meta"] = chunks_meta
     doc["chunks_count"] = len(chunks_meta)
-    doc["download_concurrency"] = max(2, min(4, s.get("bots_count", 3)))
+    doc["download_concurrency"] = max(2, min(6, s.get("bots_count", 3)))
     return doc
 
 @app.get("/api/internal/edge-config")
 async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional[str] = Header(None)):
     settings = await get_system_settings()
     resp = {
+        "channel_ids": settings.get("channel_ids", []),
         "channel_id": settings.get("channel_id", ""),
         "bot_tokens": settings.get("bot_tokens", []),
         "chunk_size_mb": settings.get("chunk_size_mb", 8),
@@ -663,7 +739,7 @@ async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional
     return resp
 
 # =========================================================
-# 4. ADMIN MASTER VAULT, SETTINGS & STORAGE PING
+# 4. ADMIN MASTER VAULT, MULTI-CHANNEL SETTINGS & STORAGE PING
 # =========================================================
 @app.get("/api/admin/files")
 async def admin_master_file_list(status: str = "all", search: str = "", owner_uid: str = "", admin: dict = Depends(require_admin)):
@@ -674,7 +750,14 @@ async def admin_master_file_list(status: str = "all", search: str = "", owner_ui
         query["owner_uid"] = owner_uid
     if search.strip():
         q_regex = {"$regex": re.escape(search.strip()), "$options": "i"}
-        query["$or"] = [{"file_name": q_regex}, {"slug": q_regex}, {"sender_note": q_regex}, {"uploader_name": q_regex}, {"owner_uid": q_regex}]
+        query["$or"] = [
+            {"file_name": q_regex},
+            {"slug": q_regex},
+            {"sender_note": q_regex},
+            {"uploader_name": q_regex},
+            {"owner_uid": q_regex},
+            {"storage_channel_id": q_regex}
+        ]
     files = await db.files.find(query, {"_id": 0, "chunks": 0}).sort("created_at", -1).to_list(500)
     return {"files": files}
 
@@ -686,19 +769,20 @@ async def admin_hard_delete_from_telegram_and_db(file_id: str, admin: dict = Dep
 
     settings = await get_system_settings()
     bots = settings.get("bot_tokens", [])
-    channel_id = settings.get("channel_id", "")
+    default_channel = doc.get("storage_channel_id") or settings.get("channel_id", "")
     tg_deleted = 0
 
-    if bots and channel_id:
+    if bots:
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             for ch in doc.get("chunks", []):
                 msg_id = ch.get("message_id")
-                if msg_id:
+                ch_id = ch.get("channel_id") or default_channel
+                if msg_id and ch_id:
                     token = bots[ch.get("bot_index", 0) % len(bots)]
                     try:
                         r = await http_client.post(
                             f"https://api.telegram.org/bot{token}/deleteMessage",
-                            json={"chat_id": channel_id, "message_id": msg_id}
+                            json={"chat_id": ch_id, "message_id": msg_id}
                         )
                         if r.status_code == 200:
                             tg_deleted += 1
@@ -733,63 +817,98 @@ async def admin_get_settings(admin: dict = Depends(require_admin)):
 
 @app.put("/api/admin/settings")
 async def admin_update_settings(payload: AdminSettingsPayload, admin: dict = Depends(require_admin)):
-    clean_bots = [t.strip() for t in payload.bot_tokens if t.strip()]
-    bots_count = max(1, len(clean_bots))
+    # Parse multiple channels cleanly
+    raw_channels = payload.channel_ids or ([payload.channel_id] if payload.channel_id else [])
+    clean_channels = []
+    for ch in raw_channels:
+        if not ch:
+            continue
+        for sub in str(ch).replace(",", "\n").split("\n"):
+            s = sub.strip()
+            if s and s not in clean_channels:
+                clean_channels.append(s)
+
+    # Parse multiple bots cleanly
+    clean_bots = []
+    for b in (payload.bot_tokens or []):
+        if not b:
+            continue
+        for sub in str(b).replace(",", "\n").split("\n"):
+            s = sub.strip()
+            if s and s not in clean_bots:
+                clean_bots.append(s)
+
+    if not clean_channels or not clean_bots:
+        raise HTTPException(status_code=400, detail="At least 1 Channel ID and 1 Bot Token are required")
+
+    bots_count = len(clean_bots)
     chunk_mb = max(2, min(19, int(payload.chunk_size_mb or 8)))
-    # Enforce rule: max_concurrency <= number of added bots
-    enforced_concurrency = max(1, min(int(payload.max_concurrency or 1), bots_count))
+    enforced_concurrency = max(1, min(int(payload.max_concurrency or bots_count), bots_count))
+    now_iso = datetime.utcnow().isoformat()
 
     await db.settings.update_one(
         {"_id": "global"},
         {"$set": {
             "guest_expiry_days": int(payload.guest_expiry_days or 3),
-            "channel_id": payload.channel_id.strip(),
+            "channel_ids": clean_channels,
+            "channel_id": clean_channels[0],
             "bot_tokens": clean_bots,
             "chunk_size_mb": chunk_mb,
             "max_concurrency": enforced_concurrency,
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": now_iso
         }},
         upsert=True
     )
+
     return {
         "ok": True,
-        "bots_count": len(clean_bots),
+        "channels_count": len(clean_channels),
+        "channel_ids": clean_channels,
+        "bots_count": bots_count,
+        "bot_tokens": clean_bots,
         "chunk_size_mb": chunk_mb,
-        "max_concurrency": enforced_concurrency
+        "max_concurrency": enforced_concurrency,
+        "updated_at": now_iso
     }
 
 @app.post("/api/admin/verify-storage")
 async def admin_verify_storage(admin: dict = Depends(require_admin)):
     s = await get_system_settings()
-    channel_id = s.get("channel_id", "")
+    channels = s.get("channel_ids", [])
+    bots = s.get("bot_tokens", [])
     results = []
-    async with httpx.AsyncClient(timeout=10.0) as client_http:
-        for idx, token in enumerate(s.get("bot_tokens", [])):
+
+    async with httpx.AsyncClient(timeout=12.0) as client_http:
+        for idx, token in enumerate(bots):
+            bot_report: Dict[str, Any] = {"bot_number": idx + 1}
             try:
                 r = await client_http.get(f"https://api.telegram.org/bot{token}/getMe")
                 me_data = r.json()
                 bot_ok = me_data.get("ok", False)
                 bot_user = me_data.get("result", {}).get("username", "Unknown")
+                bot_report["username"] = f"@{bot_user}"
+                bot_report["bot_token_valid"] = bot_ok
 
-                # Also verify channel access for this bot
-                chat_ok = False
-                if bot_ok and channel_id:
-                    cr = await client_http.get(
-                        f"https://api.telegram.org/bot{token}/getChat",
-                        params={"chat_id": channel_id}
-                    )
-                    chat_ok = cr.json().get("ok", False)
-
-                results.append({
-                    "bot_number": idx + 1,
-                    "username": f"@{bot_user}",
-                    "bot_token_valid": bot_ok,
-                    "channel_access_ok": chat_ok,
-                    "channel_id": channel_id
-                })
+                channel_checks = []
+                if bot_ok:
+                    for ch_id in channels:
+                        cr = await client_http.get(
+                            f"https://api.telegram.org/bot{token}/getChat",
+                            params={"chat_id": ch_id}
+                        )
+                        c_json = cr.json()
+                        channel_checks.append({
+                            "channel_id": ch_id,
+                            "access_ok": c_json.get("ok", False),
+                            "title": c_json.get("result", {}).get("title", c_json.get("description", "No Access"))
+                        })
+                bot_report["channels"] = channel_checks
             except Exception as e:
-                results.append({"bot_number": idx + 1, "bot_token_valid": False, "error": str(e)})
-    return {"results": results}
+                bot_report["bot_token_valid"] = False
+                bot_report["error"] = str(e)
+            results.append(bot_report)
+
+    return {"results": results, "total_channels": len(channels), "total_bots": len(bots)}
 
 # =========================================================
 # 5. TELEMETRY & WEBRTC P2P SIGNALING
