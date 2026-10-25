@@ -313,23 +313,6 @@ async def delete_folder(folder_id: str, mode: str = "trash", actor: dict = Depen
 
 @app.post("/api/files/register")
 async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_actor)):
-    # --- NEW: STRICT CHUNK ORDER & BYTE-SIZE VERIFICATION ---
-    sorted_chunks = sorted(payload.chunks, key=lambda c: c.index)
-    for expected_idx, ch in enumerate(sorted_chunks):
-        if ch.index != expected_idx or not ch.file_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Corrupted chunk sequence at index {expected_idx}"
-            )
-
-    total_chunk_bytes = sum(c.size for c in sorted_chunks)
-    if payload.file_size > 0 and total_chunk_bytes != payload.file_size:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File size mismatch: Chunks sum ({total_chunk_bytes}) != File size ({payload.file_size})"
-        )
-    # --------------------------------------------------------
-
     settings = await get_system_settings()
     slug = (payload.custom_slug or "").strip()
     if slug:
@@ -368,7 +351,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
         "expires_at": expires_at,
         "created_at": now_iso,
         "updated_at": now_iso,
-        "chunks": [c.dict() for c in sorted_chunks]  # <-- Saves strictly sorted & verified chunks
+        "chunks": [c.dict() for c in payload.chunks]
     }
 
     await db.files.insert_one(file_doc)
