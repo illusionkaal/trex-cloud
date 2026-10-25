@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 import httpx
-from bson import ObjectId
 from fastapi import FastAPI, HTTPException, Request, Depends, WebSocket, WebSocketDisconnect, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,9 +13,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from jose import jwt, JWTError
 
-app = FastAPI(title="T-Rex Cloud Enterprise Core API v5.2")
+app = FastAPI(title="T-Rex Cloud Enterprise Core API v6.1")
 
-# 1. BULLETPROOF CORS (Never combine allow_credentials=True with wildcard '*')
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +24,6 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
-# Global Exception Handler so even 500 crashes ALWAYS include CORS headers (Fixes 'Failed to fetch')
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -43,7 +40,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "trex_cloud")
 JWT_SECRET = os.getenv("JWT_SECRET", "trex_super_secret_jwt_key_2026")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "9907401831-gdo04d733h0p7a12o1e9vkdd3e2g5saq.apps.googleusercontent.com")
-SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "").lower().strip()
+SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "vikramadityakumarshukla@gmail.com").lower().strip()
 WORKER_SHARED_SECRET = os.getenv("WORKER_SHARED_SECRET", "TRex_Edge_Sync_Secret_99")
 
 DEFAULT_BOT_TOKENS = [t.strip() for t in os.getenv("TELEGRAM_BOT_TOKENS", "").split(",") if t.strip()]
@@ -52,9 +49,6 @@ DEFAULT_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client[DB_NAME]
 
-# =========================================================
-# MODELS
-# =========================================================
 class GoogleAuthPayload(BaseModel):
     credential: str
     guest_token: Optional[str] = None
@@ -100,9 +94,6 @@ class AdminSettingsPayload(BaseModel):
     channel_id: str
     bot_tokens: List[str]
 
-# =========================================================
-# HELPERS & UNIFIED AUTH
-# =========================================================
 def create_jwt(data: dict, days: int = 30) -> str:
     payload = data.copy()
     payload["exp"] = datetime.utcnow() + timedelta(days=days)
@@ -119,7 +110,6 @@ async def get_system_settings() -> dict:
         }
         await db.settings.insert_one(doc)
     else:
-        # Fallback to env vars if DB fields are empty
         if not doc.get("channel_id") and DEFAULT_CHANNEL_ID:
             doc["channel_id"] = DEFAULT_CHANNEL_ID
         if not doc.get("bot_tokens") and DEFAULT_BOT_TOKENS:
@@ -135,7 +125,7 @@ async def get_actor(
         token = authorization.replace("Bearer ", "").strip()
         try:
             decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-            user = await db.users.find_one({"uid": decoded["uid"]})
+            user = await db.users.find_one({"$or": [{"uid": decoded.get("uid")}, {"email": decoded.get("email")}]})
             if user:
                 return {
                     "uid": user["uid"],
@@ -161,13 +151,14 @@ async def get_actor(
         short_code = secrets.token_hex(4).upper()
         guest_uid = f"GUEST-{short_code[:4]}-{short_code[4:]}"
         g_token = f"gt_{secrets.token_urlsafe(24)}"
+        # Unique email placeholder per guest so MongoDB email_1 unique index never collides!
         guest = {
             "uid": guest_uid,
             "guest_token": g_token,
             "account_type": "guest",
             "role": "guest",
             "name": f"Guest ({guest_uid})",
-            "email": f"IP: {ip}",
+            "email": f"{guest_uid.lower()}@guest.ludrex.space",
             "last_ip": ip,
             "ip_hash": ip_hash,
             "total_uploads": 0,
@@ -178,7 +169,7 @@ async def get_actor(
         await db.users.insert_one(guest)
     else:
         await db.users.update_one(
-            {"uid": guest["uid"]},
+            {"_id": guest["_id"]},
             {"$set": {"last_seen": datetime.utcnow().isoformat(), "last_ip": ip}}
         )
 
@@ -188,7 +179,7 @@ async def get_actor(
         "account_type": "guest",
         "role": "guest",
         "name": guest["name"],
-        "email": guest.get("email", "")
+        "email": guest.get("last_ip", ip)
     }
 
 async def require_admin(actor: dict = Depends(get_actor)) -> dict:
@@ -196,13 +187,10 @@ async def require_admin(actor: dict = Depends(get_actor)) -> dict:
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return actor
 
-# =========================================================
-# 1. HEALTH, POLICY & GOOGLE AUTH (ASYNC HTTPX VERIFIER)
-# =========================================================
 @app.get("/")
 @app.get("/health")
 async def root_health():
-    return {"status": "T-Rex API Online", "time": datetime.utcnow().isoformat()}
+    return {"status": "T-Rex API v6.1 Online", "time": datetime.utcnow().isoformat()}
 
 @app.get("/api/public/policy")
 async def get_public_policy():
@@ -212,7 +200,7 @@ async def get_public_policy():
         n["id"] = str(n.pop("_id"))
     return {
         "guest_expiry_days": s.get("guest_expiry_days", 3),
-        "chunk_size_bytes": 10 * 1024 * 1024,
+        "chunk_size_bytes": 8 * 1024 * 1024,
         "notices": notices
     }
 
@@ -226,9 +214,9 @@ async def init_guest_session(payload: GuestInitPayload, request: Request):
         "account_type": actor["account_type"]
     }
 
+# FIXED GOOGLE LOGIN: Looks up by Email first so E11000 duplicate key error NEVER happens!
 @app.post("/api/auth/google")
 async def google_login(payload: GoogleAuthPayload):
-    # Verify Google ID Token asynchronously via Google's official tokeninfo endpoint (Immune to clock skew!)
     async with httpx.AsyncClient(timeout=10.0) as http_client:
         g_res = await http_client.get(
             "https://oauth2.googleapis.com/tokeninfo",
@@ -242,10 +230,13 @@ async def google_login(payload: GoogleAuthPayload):
     name = idinfo.get("name") or email.split("@")[0]
     picture = idinfo.get("picture", "")
     sub = idinfo.get("sub", secrets.token_hex(6))
-    uid = f"USR-{sub[:10]}"
+
+    # Check if user with this email already exists in DB
+    existing_user = await db.users.find_one({"email": email})
+    uid = existing_user.get("uid") if (existing_user and existing_user.get("uid")) else f"USR-{sub[:10]}"
 
     admin_exists = await db.users.find_one({"role": "admin"})
-    is_admin = (email == SUPER_ADMIN_EMAIL) or (admin_exists is None)
+    is_admin = (email == SUPER_ADMIN_EMAIL) or (admin_exists is None) or (existing_user and existing_user.get("role") == "admin")
     role = "admin" if is_admin else "user"
 
     user_doc = {
@@ -259,12 +250,15 @@ async def google_login(payload: GoogleAuthPayload):
         "last_seen": datetime.utcnow().isoformat()
     }
 
-    await db.users.update_one(
-        {"uid": uid},
-        {"$set": user_doc, "$setOnInsert": {"created_at": datetime.utcnow().isoformat(), "total_uploads": 0}},
-        upsert=True
-    )
+    if existing_user:
+        await db.users.update_one({"_id": existing_user["_id"]}, {"$set": user_doc})
+    else:
+        user_doc["created_at"] = datetime.utcnow().isoformat()
+        user_doc["total_uploads"] = 0
+        await db.users.insert_one(user_doc)
+        user_doc.pop("_id", None)
 
+    # Merge Guest Uploads into this User/Admin Account
     if payload.guest_token:
         guest_doc = await db.users.find_one({"guest_token": payload.guest_token})
         if guest_doc:
@@ -280,9 +274,6 @@ async def google_login(payload: GoogleAuthPayload):
     token = create_jwt({"uid": uid, "email": email, "role": role})
     return {"token": token, "user": user_doc}
 
-# =========================================================
-# 2. GOFILE FILE MANAGER & FOLDERS
-# =========================================================
 @app.post("/api/folders/create")
 async def create_folder(payload: FolderCreatePayload, actor: dict = Depends(get_actor)):
     folder_id = f"fld_{secrets.token_hex(5)}"
@@ -331,6 +322,9 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     now_iso = datetime.utcnow().isoformat()
     initial_note = (payload.sender_note or "").strip()
 
+    # Strictly sort chunks by index before storing to prevent corruption!
+    sorted_chunks = sorted([c.dict() for c in payload.chunks], key=lambda x: x["index"])
+
     file_doc = {
         "file_id": f"f_{secrets.token_hex(6)}",
         "slug": slug,
@@ -351,7 +345,8 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
         "expires_at": expires_at,
         "created_at": now_iso,
         "updated_at": now_iso,
-        "chunks": [c.dict() for c in payload.chunks]
+        "chunks_count": len(sorted_chunks),
+        "chunks": sorted_chunks
     }
 
     await db.files.insert_one(file_doc)
@@ -473,15 +468,17 @@ async def user_delete_or_restore_file(file_id: str, action: str = "trash", actor
 
 @app.get("/api/files/info/{slug}")
 async def get_public_file_info(slug: str):
-    doc = await db.files.find_one({"slug": slug, "status": "active"}, {"_id": 0, "chunks": 0})
+    doc = await db.files.find_one({"slug": slug, "status": "active"}, {"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="Link expired, trashed, or invalid")
     await db.files.update_one({"slug": slug}, {"$inc": {"views_count": 1}})
+
+    # Return safe chunk index & size list so Turbo Downloader can fetch & verify every part!
+    chunks_raw = sorted(doc.pop("chunks", []), key=lambda c: c["index"])
+    doc["chunks_meta"] = [{"index": c["index"], "size": c["size"]} for c in chunks_raw]
+    doc["chunks_count"] = len(chunks_raw)
     return doc
 
-# =========================================================
-# 3. INTERNAL EDGE WORKER CONFIG (NO STRICT SECRET BLOCK)
-# =========================================================
 @app.get("/api/internal/edge-config")
 async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional[str] = Header(None)):
     settings = await get_system_settings()
@@ -496,9 +493,6 @@ async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional
         resp["file"] = f
     return resp
 
-# =========================================================
-# 4. ADMIN MASTER VAULT, TELEGRAM PURGE & NOTICES
-# =========================================================
 @app.get("/api/admin/files")
 async def admin_master_file_list(status: str = "all", search: str = "", owner_uid: str = "", admin: dict = Depends(require_admin)):
     query: Dict[str, Any] = {}
@@ -591,9 +585,6 @@ async def admin_verify_storage(admin: dict = Depends(require_admin)):
                 results.append({"bot": idx + 1, "ok": False, "error": str(e)})
     return {"results": results}
 
-# =========================================================
-# 5. TELEMETRY & WEBRTC P2P SIGNALING
-# =========================================================
 @app.post("/api/telemetry/start")
 async def telemetry_start(request: Request):
     body = await request.json()
