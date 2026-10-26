@@ -13,7 +13,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from jose import jwt, JWTError
 
-app = FastAPI(title="T-Rex Cloud Enterprise Core API v8.0 (Multi-Channel Cluster)")
+app = FastAPI(title="T-Rex Cloud Enterprise Core API v9.0 (Multi-File & Folder Tree Edition)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -85,6 +85,7 @@ class FileRegisterPayload(BaseModel):
     sender_note: Optional[str] = ""
     custom_slug: Optional[str] = None
     folder_id: Optional[str] = "root"
+    relative_path: Optional[str] = ""
     chunks: List[StrictChunkItem]
 
 class WatcherDownloadVerifyPayload(BaseModel):
@@ -106,6 +107,14 @@ class FileUpdatePayload(BaseModel):
 class FolderCreatePayload(BaseModel):
     name: str
     parent_id: Optional[str] = "root"
+
+class FolderTreeEnsurePayload(BaseModel):
+    base_folder_id: str = "root"
+    paths: List[str]          # e.g. ["ProjectA", "ProjectA/CAD", "ProjectA/Docs/Specs"]
+    create_share_slug: bool = True
+    custom_slug: Optional[str] = None
+    sender_note: Optional[str] = ""
+    bundle_title: Optional[str] = ""
 
 class NoticeCreatePayload(BaseModel):
     title: str
@@ -144,7 +153,6 @@ async def get_system_settings() -> dict:
         }
         await db.settings.insert_one(doc)
 
-    # Normalize channel_ids list & legacy channel_id field
     raw_channels = doc.get("channel_ids") or []
     if isinstance(raw_channels, str):
         raw_channels = [c.strip() for c in raw_channels.split("\n") if c.strip()]
@@ -190,7 +198,6 @@ async def get_system_settings() -> dict:
     }
 
 async def pick_dedicated_channel_for_file() -> str:
-    """Selects ONE dedicated channel in round-robin order so ALL parts of a file stay in the exact same channel."""
     s = await get_system_settings()
     channels = s.get("channel_ids") or []
     if not channels:
@@ -198,7 +205,6 @@ async def pick_dedicated_channel_for_file() -> str:
     if len(channels) == 1:
         return channels[0]
 
-    # Atomic round-robin counter in MongoDB
     res = await db.settings.find_one_and_update(
         {"_id": "global"},
         {"$inc": {"channel_cursor": 1}},
@@ -284,7 +290,7 @@ async def require_admin(actor: dict = Depends(get_actor)) -> dict:
 @app.get("/")
 @app.get("/health")
 async def root_health():
-    return {"status": "T-Rex API v8.0 Multi-Channel Active", "time": datetime.utcnow().isoformat()}
+    return {"status": "T-Rex API v9.0 Multi-File & Folder Tree Active", "time": datetime.utcnow().isoformat()}
 
 @app.get("/api/public/policy")
 async def get_public_policy():
@@ -371,14 +377,101 @@ async def google_login(payload: GoogleAuthPayload):
     return {"token": token, "user": user_doc}
 
 # =========================================================
-# 2. MULTI-CHANNEL WATCHER & STRICT SINGLE-CHANNEL AFFINITY
+# 2. RECURSIVE FOLDER TREE BUILDER (FOR FOLDER & MULTI-FILE UPLOADS)
+# =========================================================
+@app.post("/api/folders/ensure-tree")
+async def ensure_folder_tree(payload: FolderTreeEnsurePayload, actor: dict = Depends(get_actor)):
+    """
+    Reconstructs an entire nested directory hierarchy in MongoDB before uploading a folder/batch,
+    and optionally creates a public shareable slug for the top-level folder/bundle!
+    """
+    settings = await get_system_settings()
+    now_iso = datetime.utcnow().isoformat()
+    path_to_folder_id: Dict[str, str] = {"": payload.base_folder_id or "root"}
+    top_folder_id = payload.base_folder_id or "root"
+
+    # If user uploaded multiple loose files without a folder, create a bundle folder if requested
+    if not payload.paths and payload.create_share_slug and payload.bundle_title:
+        payload.paths = [payload.bundle_title]
+
+    # Sort paths by depth so parent folders are always created before children
+    cleaned_paths = sorted(
+        list({p.strip().strip("/") for p in payload.paths if p.strip().strip("/")}),
+        key=lambda x: x.count("/")
+    )
+
+    for rel_path in cleaned_paths:
+        segments = [seg.strip() for seg in rel_path.split("/") if seg.strip()]
+        curr_parent = payload.base_folder_id or "root"
+        accum = ""
+        for idx, seg in enumerate(segments):
+            accum = f"{accum}/{seg}" if accum else seg
+            if accum in path_to_folder_id:
+                curr_parent = path_to_folder_id[accum]
+                continue
+
+            # Check if folder with same name already exists under curr_parent
+            existing = await db.folders.find_one({
+                "owner_uid": actor["uid"],
+                "parent_id": curr_parent,
+                "name": seg,
+                "status": "active"
+            })
+            if existing:
+                fld_id = existing["folder_id"]
+            else:
+                fld_id = f"fld_{secrets.token_hex(5)}"
+                await db.folders.insert_one({
+                    "folder_id": fld_id,
+                    "name": seg,
+                    "parent_id": curr_parent,
+                    "relative_path": accum,
+                    "owner_uid": actor["uid"],
+                    "uploader_name": actor["name"],
+                    "status": "active",
+                    "created_at": now_iso
+                })
+            path_to_folder_id[accum] = fld_id
+            curr_parent = fld_id
+            if idx == 0 and top_folder_id == (payload.base_folder_id or "root"):
+                top_folder_id = fld_id
+
+    folder_slug = None
+    expires_at = "Permanent" if actor["account_type"] == "user" else (
+        datetime.utcnow() + timedelta(days=int(settings.get("guest_expiry_days", 3)))
+    ).isoformat()
+
+    if payload.create_share_slug and top_folder_id != "root":
+        raw_slug = (payload.custom_slug or "").strip()
+        if raw_slug:
+            folder_slug = re.sub(r"[^a-zA-Z0-9_-]", "-", raw_slug)
+            if await db.files.find_one({"slug": folder_slug}) or await db.folders.find_one({"slug": folder_slug}):
+                folder_slug = f"{folder_slug}-{secrets.token_hex(2)}"
+        else:
+            folder_slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+
+        await db.folders.update_one(
+            {"folder_id": top_folder_id},
+            {"$set": {
+                "slug": folder_slug,
+                "sender_note": (payload.sender_note or "").strip(),
+                "expires_at": expires_at,
+                "is_shared": True
+            }}
+        )
+
+    return {
+        "path_map": path_to_folder_id,
+        "top_folder_id": top_folder_id,
+        "folder_slug": folder_slug,
+        "expires_at": expires_at
+    }
+
+# =========================================================
+# 3. MULTI-CHANNEL WATCHER & STRICT SINGLE-CHANNEL AFFINITY
 # =========================================================
 @app.post("/api/watcher/init-upload")
 async def watcher_init_upload(payload: WatcherUploadInitPayload, actor: dict = Depends(get_actor)):
-    """
-    Assigns ONE dedicated Storage Channel (`target_channel_id`) for this entire file
-    so all chunks of this file stay together in the same channel!
-    """
     s = await get_system_settings()
     target_channel_id = await pick_dedicated_channel_for_file()
     if not target_channel_id:
@@ -435,7 +528,6 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     if not sorted_chunks:
         raise HTTPException(status_code=400, detail="Watcher Error: No chunks received")
 
-    # Lock the single storage channel used for this file
     locked_channel = (
         payload.target_channel_id
         or sorted_chunks[0].get("channel_id")
@@ -465,7 +557,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
     slug = (payload.custom_slug or "").strip()
     if slug:
         slug = re.sub(r"[^a-zA-Z0-9_-]", "-", slug)
-        if await db.files.find_one({"slug": slug}):
+        if await db.files.find_one({"slug": slug}) or await db.folders.find_one({"slug": slug}):
             slug = f"{slug}-{secrets.token_hex(2)}"
     else:
         slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
@@ -487,6 +579,7 @@ async def register_file(payload: FileRegisterPayload, actor: dict = Depends(get_
         "slug": slug,
         "slug_history": [{"slug": slug, "changed_at": now_iso}],
         "file_name": payload.file_name,
+        "relative_path": payload.relative_path or payload.file_name,
         "file_size": payload.file_size,
         "mime_type": payload.mime_type,
         "folder_id": payload.folder_id or "root",
@@ -549,16 +642,19 @@ async def watcher_verify_download(payload: WatcherDownloadVerifyPayload):
     return {"ok": True}
 
 # =========================================================
-# 3. GOFILE FILE MANAGER & FOLDERS
+# 4. GOFILE FILE MANAGER & FOLDERS
 # =========================================================
 @app.post("/api/folders/create")
 async def create_folder(payload: FolderCreatePayload, actor: dict = Depends(get_actor)):
     folder_id = f"fld_{secrets.token_hex(5)}"
+    slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
     doc = {
         "folder_id": folder_id,
         "name": payload.name.strip() or "New Folder",
         "parent_id": payload.parent_id or "root",
+        "slug": slug,
         "owner_uid": actor["uid"],
+        "uploader_name": actor["name"],
         "status": "active",
         "created_at": datetime.utcnow().isoformat()
     }
@@ -598,7 +694,7 @@ async def list_user_file_manager(
 
     if search.strip():
         q_regex = {"$regex": re.escape(search.strip()), "$options": "i"}
-        query["$or"] = [{"file_name": q_regex}, {"slug": q_regex}, {"sender_note": q_regex}]
+        query["$or"] = [{"file_name": q_regex}, {"slug": q_regex}, {"sender_note": q_regex}, {"relative_path": q_regex}]
 
     if file_type != "all":
         type_map = {
@@ -692,34 +788,78 @@ async def user_delete_or_restore_file(file_id: str, action: str = "trash", actor
     )
     return {"ok": True, "file_id": file_id, "status": new_status}
 
+# Helper to collect all nested files & subfolders inside a shared folder
+async def gather_folder_bundle(root_folder: dict) -> dict:
+    all_folder_ids = [root_folder["folder_id"]]
+    subfolders = []
+    queue = [root_folder["folder_id"]]
+
+    while queue:
+        curr_id = queue.pop(0)
+        children = await db.folders.find(
+            {"parent_id": curr_id, "status": "active"},
+            {"_id": 0}
+        ).to_list(200)
+        for ch in children:
+            all_folder_ids.append(ch["folder_id"])
+            subfolders.append(ch)
+            queue.append(ch["folder_id"])
+
+    files = await db.files.find(
+        {"folder_id": {"$in": all_folder_ids}, "status": "active"},
+        {"_id": 0, "chunks": 0}
+    ).sort("relative_path", 1).to_list(1000)
+
+    total_size = sum(int(f.get("file_size", 0)) for f in files)
+    return {
+        "is_folder_bundle": True,
+        "folder_id": root_folder["folder_id"],
+        "slug": root_folder.get("slug"),
+        "file_name": root_folder.get("name", "Shared Folder"),
+        "file_size": total_size,
+        "files_count": len(files),
+        "uploader_name": root_folder.get("uploader_name", "User"),
+        "sender_note": root_folder.get("sender_note", ""),
+        "expires_at": root_folder.get("expires_at", "Permanent"),
+        "subfolders": subfolders,
+        "files": files
+    }
+
 @app.get("/api/files/info/{slug}")
-async def get_public_file_info(slug: str):
+async def get_public_file_or_folder_info(slug: str):
+    # 1. Check if slug is a single file
     doc = await db.files.find_one({"slug": slug, "status": "active"}, {"_id": 0})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Link expired, trashed, or invalid")
-    await db.files.update_one({"slug": slug}, {"$inc": {"views_count": 1}})
+    if doc:
+        await db.files.update_one({"slug": slug}, {"$inc": {"views_count": 1}})
+        s = await get_system_settings()
+        chunks_raw = sorted(doc.pop("chunks", []), key=lambda c: c["index"])
 
-    s = await get_system_settings()
-    chunks_raw = sorted(doc.pop("chunks", []), key=lambda c: c["index"])
+        cumulative = 0
+        chunks_meta = []
+        for idx, c in enumerate(chunks_raw):
+            sz = int(c["size"])
+            chunks_meta.append({
+                "part_id": c.get("part_id") or f"PART-{idx:04d}",
+                "index": idx,
+                "start_byte": c.get("start_byte", cumulative),
+                "end_byte": c.get("end_byte", cumulative + sz - 1),
+                "size": sz,
+                "channel_id": c.get("channel_id") or doc.get("storage_channel_id") or s.get("channel_id")
+            })
+            cumulative += sz
 
-    cumulative = 0
-    chunks_meta = []
-    for idx, c in enumerate(chunks_raw):
-        sz = int(c["size"])
-        chunks_meta.append({
-            "part_id": c.get("part_id") or f"PART-{idx:04d}",
-            "index": idx,
-            "start_byte": c.get("start_byte", cumulative),
-            "end_byte": c.get("end_byte", cumulative + sz - 1),
-            "size": sz,
-            "channel_id": c.get("channel_id") or doc.get("storage_channel_id") or s.get("channel_id")
-        })
-        cumulative += sz
+        doc["is_folder_bundle"] = False
+        doc["chunks_meta"] = chunks_meta
+        doc["chunks_count"] = len(chunks_meta)
+        doc["download_concurrency"] = max(2, min(6, s.get("bots_count", 3)))
+        return doc
 
-    doc["chunks_meta"] = chunks_meta
-    doc["chunks_count"] = len(chunks_meta)
-    doc["download_concurrency"] = max(2, min(6, s.get("bots_count", 3)))
-    return doc
+    # 2. Check if slug is a shared Folder / Multi-File Bundle!
+    folder_doc = await db.folders.find_one({"slug": slug, "status": "active"}, {"_id": 0})
+    if folder_doc:
+        return await gather_folder_bundle(folder_doc)
+
+    raise HTTPException(status_code=404, detail="Link expired, trashed, or invalid")
 
 @app.get("/api/internal/edge-config")
 async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional[str] = Header(None)):
@@ -739,7 +879,7 @@ async def edge_worker_config(slug: Optional[str] = None, x_edge_secret: Optional
     return resp
 
 # =========================================================
-# 4. ADMIN MASTER VAULT, MULTI-CHANNEL SETTINGS & STORAGE PING
+# 5. ADMIN MASTER VAULT, MULTI-CHANNEL SETTINGS & STORAGE PING
 # =========================================================
 @app.get("/api/admin/files")
 async def admin_master_file_list(status: str = "all", search: str = "", owner_uid: str = "", admin: dict = Depends(require_admin)):
@@ -817,7 +957,6 @@ async def admin_get_settings(admin: dict = Depends(require_admin)):
 
 @app.put("/api/admin/settings")
 async def admin_update_settings(payload: AdminSettingsPayload, admin: dict = Depends(require_admin)):
-    # Parse multiple channels cleanly
     raw_channels = payload.channel_ids or ([payload.channel_id] if payload.channel_id else [])
     clean_channels = []
     for ch in raw_channels:
@@ -828,7 +967,6 @@ async def admin_update_settings(payload: AdminSettingsPayload, admin: dict = Dep
             if s and s not in clean_channels:
                 clean_channels.append(s)
 
-    # Parse multiple bots cleanly
     clean_bots = []
     for b in (payload.bot_tokens or []):
         if not b:
@@ -911,7 +1049,7 @@ async def admin_verify_storage(admin: dict = Depends(require_admin)):
     return {"results": results, "total_channels": len(channels), "total_bots": len(bots)}
 
 # =========================================================
-# 5. TELEMETRY & WEBRTC P2P SIGNALING
+# 6. TELEMETRY & WEBRTC P2P SIGNALING
 # =========================================================
 @app.post("/api/telemetry/start")
 async def telemetry_start(request: Request):
