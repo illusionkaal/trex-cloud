@@ -381,20 +381,14 @@ async def google_login(payload: GoogleAuthPayload):
 # =========================================================
 @app.post("/api/folders/ensure-tree")
 async def ensure_folder_tree(payload: FolderTreeEnsurePayload, actor: dict = Depends(get_actor)):
-    """
-    Reconstructs an entire nested directory hierarchy in MongoDB before uploading a folder/batch,
-    and optionally creates a public shareable slug for the top-level folder/bundle!
-    """
     settings = await get_system_settings()
     now_iso = datetime.utcnow().isoformat()
     path_to_folder_id: Dict[str, str] = {"": payload.base_folder_id or "root"}
     top_folder_id = payload.base_folder_id or "root"
 
-    # If user uploaded multiple loose files without a folder, create a bundle folder if requested
     if not payload.paths and payload.create_share_slug and payload.bundle_title:
         payload.paths = [payload.bundle_title]
 
-    # Sort paths by depth so parent folders are always created before children
     cleaned_paths = sorted(
         list({p.strip().strip("/") for p in payload.paths if p.strip().strip("/")}),
         key=lambda x: x.count("/")
@@ -410,7 +404,6 @@ async def ensure_folder_tree(payload: FolderTreeEnsurePayload, actor: dict = Dep
                 curr_parent = path_to_folder_id[accum]
                 continue
 
-            # Check if folder with same name already exists under curr_parent
             existing = await db.folders.find_one({
                 "owner_uid": actor["uid"],
                 "parent_id": curr_parent,
@@ -421,11 +414,14 @@ async def ensure_folder_tree(payload: FolderTreeEnsurePayload, actor: dict = Dep
                 fld_id = existing["folder_id"]
             else:
                 fld_id = f"fld_{secrets.token_hex(5)}"
+                # Always assign a unique slug so MongoDB unique index on slug_1 NEVER throws E11000!
+                auto_sub_slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
                 await db.folders.insert_one({
                     "folder_id": fld_id,
                     "name": seg,
                     "parent_id": curr_parent,
                     "relative_path": accum,
+                    "slug": auto_sub_slug,
                     "owner_uid": actor["uid"],
                     "uploader_name": actor["name"],
                     "status": "active",
@@ -445,10 +441,11 @@ async def ensure_folder_tree(payload: FolderTreeEnsurePayload, actor: dict = Dep
         raw_slug = (payload.custom_slug or "").strip()
         if raw_slug:
             folder_slug = re.sub(r"[^a-zA-Z0-9_-]", "-", raw_slug)
-            if await db.files.find_one({"slug": folder_slug}) or await db.folders.find_one({"slug": folder_slug}):
+            if await db.files.find_one({"slug": folder_slug}) or await db.folders.find_one({"slug": folder_slug, "folder_id": {"$ne": top_folder_id}}):
                 folder_slug = f"{folder_slug}-{secrets.token_hex(2)}"
         else:
-            folder_slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+            top_doc = await db.folders.find_one({"folder_id": top_folder_id})
+            folder_slug = (top_doc or {}).get("slug") or secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
 
         await db.folders.update_one(
             {"folder_id": top_folder_id},
