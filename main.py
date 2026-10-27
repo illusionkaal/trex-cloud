@@ -1124,3 +1124,134 @@ async def p2p_signaling(websocket: WebSocket, room_code: str):
     except WebSocketDisconnect:
         if room_code in p2p_rooms and websocket in p2p_rooms[room_code]:
             p2p_rooms[room_code].remove(websocket)
+# =========================================================
+# ADD THESE MODELS & ROUTES TO main.py FOR v11.0 X-RAY & PERMISSIONS
+# =========================================================
+class AccessPermissionPayload(BaseModel):
+    target_type: str = "folder"  # "folder" or "file"
+    target_id: str
+    is_public: Optional[bool] = None
+    password: Optional[str] = None
+    remove_password: Optional[bool] = False
+    apply_recursive: Optional[bool] = False
+
+class TagsDescriptionPayload(BaseModel):
+    target_type: str = "file"    # "folder" or "file"
+    target_id: str
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+@app.put("/api/manager/permissions")
+async def update_access_and_permissions(payload: AccessPermissionPayload, actor: dict = Depends(get_actor)):
+    """Handles Public/Private toggle, Password Protection, and Recursive Subfolder application."""
+    now_iso = datetime.utcnow().isoformat()
+    updates: Dict[str, Any] = {"updated_at": now_iso}
+
+    if payload.is_public is not None:
+        updates["is_public"] = payload.is_public
+    if payload.remove_password:
+        updates["access_password"] = ""
+        updates["has_password"] = False
+    elif payload.password is not None and payload.password.strip():
+        updates["access_password"] = payload.password.strip()
+        updates["has_password"] = True
+
+    if payload.target_type == "folder":
+        if payload.target_id == "root":
+            await db.users.update_one({"uid": actor["uid"]}, {"$set": {"root_permissions": updates}})
+            if payload.apply_recursive:
+                await db.folders.update_many({"owner_uid": actor["uid"]}, {"$set": updates})
+                await db.files.update_many({"owner_uid": actor["uid"]}, {"$set": updates})
+        else:
+            await db.folders.update_one({"folder_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+            if payload.apply_recursive:
+                # Apply to all files and child folders inside this folder
+                await db.files.update_many({"folder_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+                await db.folders.update_many({"parent_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+    else:
+        await db.files.update_one({"file_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+
+    return {"ok": True, **updates}
+
+@app.put("/api/manager/meta")
+async def update_tags_and_description(payload: TagsDescriptionPayload, actor: dict = Depends(get_actor)):
+    """Updates Description (Note), Tags, or Name for any Folder or File."""
+    now_iso = datetime.utcnow().isoformat()
+    updates: Dict[str, Any] = {"updated_at": now_iso}
+
+    if payload.description is not None:
+        updates["sender_note"] = payload.description.strip()
+        updates["description"] = payload.description.strip()
+    if payload.tags is not None:
+        updates["tags"] = [t.strip() for t in payload.tags if t.strip()][:12]
+
+    if payload.target_type == "folder":
+        if payload.target_id == "root":
+            await db.users.update_one({"uid": actor["uid"]}, {"$set": {"root_meta": updates}})
+        else:
+            await db.folders.update_one({"folder_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+    else:
+        doc = await db.files.find_one({"file_id": payload.target_id, "owner_uid": actor["uid"]})
+        if doc and payload.description is not None:
+            hist = doc.get("note_history", [])
+            hist.append({"note": payload.description.strip() or "[Cleared]", "changed_at": now_iso, "by": actor["name"]})
+            updates["note_history"] = hist
+        await db.files.update_one({"file_id": payload.target_id, "owner_uid": actor["uid"]}, {"$set": updates})
+
+    return {"ok": True, **updates}
+
+@app.get("/api/manager/xray/{target_type}/{target_id}")
+async def get_detailed_item_xray(target_type: str, target_id: str, actor: dict = Depends(get_actor)):
+    """Returns Complete Deep X-Ray Diagnostics for any File or Folder (Uploader, IP, Channel, Chunks, Telemetry)."""
+    if target_type == "file":
+        q = {"file_id": target_id} if actor["role"] == "admin" else {"file_id": target_id, "owner_uid": actor["uid"]}
+        doc = await db.files.find_one(q, {"_id": 0})
+        if not doc:
+            raise HTTPException(status_code=404, detail="File not found")
+        owner_doc = await db.users.find_one({"uid": doc.get("owner_uid")}, {"_id": 0, "guest_token": 0})
+        recent_views = await db.telemetry.find({"slug": doc.get("slug")}, {"_id": 0}).sort("opened_at", -1).limit(10).to_list(10)
+        return {
+            "target_type": "file",
+            "item": doc,
+            "uploader_profile": owner_doc or {},
+            "recent_telemetry": recent_views
+        }
+    else:
+        if target_id == "root":
+            files = await db.files.find({"owner_uid": actor["uid"], "status": "active"}, {"_id": 0, "chunks": 0}).to_list(500)
+            folders = await db.folders.find({"owner_uid": actor["uid"], "status": "active"}, {"_id": 0}).to_list(200)
+            owner_doc = await db.users.find_one({"uid": actor["uid"]}, {"_id": 0, "guest_token": 0})
+            return {
+                "target_type": "folder",
+                "item": {
+                    "folder_id": "root",
+                    "name": "root",
+                    "owner_uid": actor["uid"],
+                    "uploader_name": actor["name"],
+                    "created_at": (owner_doc or {}).get("created_at", datetime.utcnow().isoformat()),
+                    "files_count": len(files),
+                    "folders_count": len(folders),
+                    "total_size": sum(int(f.get("file_size", 0)) for f in files),
+                    "is_public": (owner_doc or {}).get("root_permissions", {}).get("is_public", False),
+                    "has_password": (owner_doc or {}).get("root_permissions", {}).get("has_password", False),
+                    "description": (owner_doc or {}).get("root_meta", {}).get("description", ""),
+                    "tags": (owner_doc or {}).get("root_meta", {}).get("tags", [])
+                },
+                "uploader_profile": owner_doc or {},
+                "recent_telemetry": []
+            }
+        fld = await db.folders.find_one({"folder_id": target_id, "owner_uid": actor["uid"]}, {"_id": 0})
+        if not fld:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        files = await db.files.find({"folder_id": target_id, "status": "active"}, {"_id": 0, "chunks": 0}).to_list(500)
+        subfolders = await db.folders.find({"parent_id": target_id, "status": "active"}, {"_id": 0}).to_list(200)
+        owner_doc = await db.users.find_one({"uid": fld.get("owner_uid")}, {"_id": 0, "guest_token": 0})
+        fld["files_count"] = len(files)
+        fld["folders_count"] = len(subfolders)
+        fld["total_size"] = sum(int(f.get("file_size", 0)) for f in files)
+        return {
+            "target_type": "folder",
+            "item": fld,
+            "uploader_profile": owner_doc or {},
+            "recent_telemetry": []
+        }
